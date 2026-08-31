@@ -1,0 +1,7 @@
+# Native build sources and generated Visual Studio/CMake files
+native/
+runtime/
+# Python bytecode caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
