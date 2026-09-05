@@ -100,7 +100,9 @@ class _CudaNvof:
             with self._caller_context_restored():
                 self.handle = self.create(width, height, b"{}")
         except (AttributeError, OSError) as exc:
-            raise GuidanceError(f"Could not load CUDA NVOF bridge {path}: {exc}") from exc
+            raise GuidanceError(
+                f"Could not load CUDA NVOF bridge {path} or the CUDA driver (nvcuda.dll): {exc}"
+            ) from exc
         if not self.handle:
             detail = ""
             if self.last_error is not None:
@@ -113,7 +115,8 @@ class _CudaNvof:
         details = ""
         if self.info_fn is not None:
             try:
-                details = (self.info_fn(self.handle) or b"").decode("utf-8", "replace")
+                with self._caller_context_restored():
+                    details = (self.info_fn(self.handle) or b"").decode("utf-8", "replace")
             except Exception:
                 details = ""
         LOGGER.info("[TE DLSS5] NVOF ready: dll=%s, size=%sx%s%s", path, width, height,
@@ -143,7 +146,13 @@ class _CudaNvof:
         try:
             yield
         finally:
-            self._cu_ctx_set_current(saved)
+            result = self._cu_ctx_set_current(saved)
+            if result != 0:
+                LOGGER.warning(
+                    "[TE DLSS5] restoring the caller CUDA context after an NVOF "
+                    "call failed (CUresult=%d); subsequent PyTorch CUDA work "
+                    "may run in the wrong context", result,
+                )
 
     def next(self, frame: bytes):
         src = ctypes.create_string_buffer(frame)
