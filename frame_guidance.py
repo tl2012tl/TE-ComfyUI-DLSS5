@@ -29,19 +29,40 @@ class GuidanceError(RuntimeError):
     """Raised when a requested guide cannot be produced."""
 
 
+def nvof_dll_candidates() -> list[Path]:
+    """Search order for the CUDA NVOF bridge, shared with diagnostics."""
+    configured = os.environ.get("TE_NVOF_DLL", "").strip()
+    root = Path(__file__).resolve().parent
+    candidates = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend((root / "te_nvof_cuda.dll", root / "native" / "te_nvof_cuda.dll"))
+    return candidates
+
+
+def cuda_bin_candidates() -> list[Path]:
+    """CUDA toolkit bin directories that may hold the NVOF SDK's DLL deps."""
+    roots = [os.environ.get("CUDA_PATH", "").strip(),
+             os.environ.get("CUDA_PATH_V13_1", "").strip(),
+             r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"]
+    bins = []
+    for cuda_root in roots:
+        if not cuda_root:
+            continue
+        cuda_bin = Path(cuda_root) / "bin"
+        if cuda_bin.is_dir():
+            bins.append(cuda_bin)
+            break
+    return bins
+
+
 class _CudaNvof:
     """Adapter for the official CUDA Optical Flow SDK bridge."""
 
     def __init__(self, width: int, height: int):
         if os.name != "nt":
             raise GuidanceError("CUDA NVOF guidance requires Windows")
-        root = Path(__file__).resolve().parent
-        candidates = []
-        configured = os.environ.get("TE_NVOF_DLL", "").strip()
-        if configured:
-            candidates.append(Path(configured))
-        candidates.extend((root / "te_nvof_cuda.dll", root / "native" / "te_nvof_cuda.dll"))
-        path = next((item for item in candidates if item.is_file()), None)
+        path = next((item for item in nvof_dll_candidates() if item.is_file()), None)
         if path is None:
             raise GuidanceError(
                 "CUDA NVOF bridge is not built; run native\\build_nvof.bat "
@@ -50,19 +71,11 @@ class _CudaNvof:
         try:
             self._dll_dirs = []
             if hasattr(os, "add_dll_directory"):
-                cuda_roots = [os.environ.get("CUDA_PATH", "").strip(),
-                              os.environ.get("CUDA_PATH_V13_1", "").strip(),
-                              r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"]
-                for cuda_root in cuda_roots:
-                    if not cuda_root:
-                        continue
-                    cuda_bin = Path(cuda_root) / "bin"
-                    if cuda_bin.is_dir():
-                        try:
-                            self._dll_dirs.append(os.add_dll_directory(str(cuda_bin)))
-                        except OSError:
-                            pass
-                        break
+                for cuda_bin in cuda_bin_candidates():
+                    try:
+                        self._dll_dirs.append(os.add_dll_directory(str(cuda_bin)))
+                    except OSError:
+                        pass
             self.dll = ctypes.WinDLL(str(path))
             self.create = self._bind("te_nvof_create", ctypes.c_void_p,
                                      [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p])
