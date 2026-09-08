@@ -89,6 +89,7 @@ class VideoJob:
     backend_dll: str
     runtime_dir: str
     overwrite: bool
+    output_mode: str = "video"
 
 
 def _run(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess:
@@ -111,7 +112,10 @@ def _ffprobe(source: Path) -> dict:
         result = _run(
             [
                 ffprobe, "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,avg_frame_rate,pix_fmt,color_space,color_transfer,color_primaries,color_range",
+                "-show_entries",
+                "stream=width,height,avg_frame_rate,nb_frames,duration,pix_fmt,"
+                "color_space,color_transfer,color_primaries,color_range",
+                "-show_entries", "format=duration",
                 "-of", "json", str(source),
             ],
             capture=True,
@@ -120,10 +124,12 @@ def _ffprobe(source: Path) -> dict:
         raise RuntimeError(
             "ffprobe could not be started. Set TE_DLSS5_FFPROBE_PATH to the full path of ffprobe.exe"
         ) from exc
-    streams = json.loads(result.stdout).get("streams", [])
+    payload = json.loads(result.stdout)
+    streams = payload.get("streams", [])
     if not streams:
         raise RuntimeError(f"No video stream found in {source}")
     stream = streams[0]
+    container = payload.get("format", {})
 
     def ratio(value: str) -> float:
         if not value or value == "0/0":
@@ -131,10 +137,22 @@ def _ffprobe(source: Path) -> dict:
         num, den = value.split("/", 1)
         return float(num) / float(den)
 
+    def duration_of(*values: str) -> float:
+        for value in values:
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            if seconds > 0:
+                return seconds
+        return 0.0
+
     return {
         "width": int(stream["width"]),
         "height": int(stream["height"]),
         "fps": ratio(stream.get("avg_frame_rate", "0/0")),
+        "frame_estimate": int(stream["nb_frames"]) if str(stream.get("nb_frames", "")).isdigit() else 0,
+        "duration": duration_of(stream.get("duration"), container.get("duration")),
         "pix_fmt": stream.get("pix_fmt", ""),
         "color_space": stream.get("color_space", ""),
         "color_transfer": stream.get("color_transfer", ""),
@@ -308,7 +326,7 @@ def _safe_positive_float(value) -> float:
     return result if math.isfinite(result) and result > 0.0 else 0.0
 
 
-def _video_info_fps(video_info) -> float:
+def video_info_fps(video_info) -> float:
     """Read VHS metadata across dict/object variants without touching payload bytes."""
     if video_info is None or isinstance(video_info, (bytes, bytearray, memoryview)):
         return 0.0
@@ -340,7 +358,37 @@ def _video_info_fps(video_info) -> float:
     return 0.0
 
 
-def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=None, video_info=None) -> Path:
+class _NoProgress:
+    """Stand-in for ComfyUI's ProgressBar outside the server (smoke tests)."""
+
+    def update_absolute(self, value, total=None, preview=None):
+        pass
+
+
+def _make_progress(images, info: dict, fps: float):
+    """UI progress bar with a best-effort total; None when it cannot help."""
+    try:
+        from comfy.utils import ProgressBar  # type: ignore
+    except Exception:
+        return _NoProgress()
+    if images is not None:
+        total = int(images.shape[0])
+    else:
+        total = int(info.get("frame_estimate", 0) or 0)
+        if total <= 0:
+            duration = float(info.get("duration") or 0.0)
+            if duration > 0 and fps > 0:
+                total = int(round(duration * fps))
+    if total <= 0:
+        return _NoProgress()
+    try:
+        return ProgressBar(total)
+    except Exception:
+        return _NoProgress()
+
+
+def run_video_job(job: VideoJob, *, images=None, audio=None, video_info=None):
+    frames_mode = job.output_mode == "frames"
     if os.name != "nt":
         raise RuntimeError("TE DLSS5 currently requires Windows and an NVIDIA NGX backend")
     backend_path = resolve_backend(job.backend_dll)
@@ -351,9 +399,11 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
         )
 
     # Resolve once up front so a missing executable is reported before native
-    # initialization or temporary files are created.
-    ffmpeg = _resolve_media_tool("ffmpeg")
-    LOGGER.info("[TE DLSS5] FFmpeg executable: %s", ffmpeg)
+    # initialization or temporary files are created. Frames mode skips the
+    # encode path entirely, but file sources still need FFmpeg to decode.
+    ffmpeg = _resolve_media_tool("ffmpeg") if (not frames_mode or images is None) else None
+    if ffmpeg is not None:
+        LOGGER.info("[TE DLSS5] FFmpeg executable: %s", ffmpeg)
 
     if images is None:
         if job.source is None or not job.source.is_file():
@@ -364,7 +414,7 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
     else:
         height, width = int(images.shape[1]), int(images.shape[2])
         source_fps = 0.0
-        source_fps = _video_info_fps(video_info)
+        source_fps = video_info_fps(video_info)
         info = {}
     fps = job.output_fps if job.output_fps > 0 else source_fps
     if fps <= 0:
@@ -373,15 +423,19 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
         fps = 24.0
 
     settings = _settings(job)
-    output = _output_path(job)
+    output = None if frames_mode else _output_path(job)
     frame_size = width * height * 4
     LOGGER.info(
-        "[TE DLSS5] job start: guidance=%s, size=%sx%s, fps=%.3f, depth_interval=%d, style=%s, intensity=%.3f, local_tone=%.3f, local_structure=%.3f",
-        job.guidance, width, height, fps, max(1, int(job.depth_interval)), job.style, settings["intensity"],
+        "[TE DLSS5] job start: mode=%s, guidance=%s, size=%sx%s, fps=%.3f, depth_interval=%d, style=%s, intensity=%.3f, local_tone=%.3f, local_structure=%.3f",
+        job.output_mode, job.guidance, width, height, fps, max(1, int(job.depth_interval)), job.style, settings["intensity"],
         settings["localToneStrength"], settings["localStructureStrength"],
     )
-    LOGGER.info("[TE DLSS5] backend=%s, runtime=%s, output=%s", backend_path, settings["runtimeDir"], output)
+    if output is not None:
+        LOGGER.info("[TE DLSS5] backend=%s, runtime=%s, output=%s", backend_path, settings["runtimeDir"], output)
+    else:
+        LOGGER.info("[TE DLSS5] backend=%s, runtime=%s, output=in-memory IMAGE batch", backend_path, settings["runtimeDir"])
 
+    progress = _make_progress(images, info, fps)
     with tempfile.TemporaryDirectory(prefix="te_dlss5_") as temp_dir:
         silent_video = Path(temp_dir) / "video_only.mp4"
         encode = None
@@ -392,6 +446,7 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
         ab_psnr = []
         async_executor = None
         pending_native = deque()
+        frames_out = []
         frame_count = 0
         try:
             with FrameGuidance(width, height, job.guidance, settings["runtimeDir"], job.depth_interval) as guidance, NativeEnhancer(
@@ -425,21 +480,29 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                     # for frame N. Ordering is preserved by the executor.
                     async_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="te-dlss5-native")
                     LOGGER.info("[TE DLSS5] native submit queue enabled: depth=2")
-                LOGGER.info("[TE DLSS5] native DLSSNR backend ready; frame pipeline=RGBA -> guidance -> DLSSNR Feature 18 -> H.264")
-                encode = subprocess.Popen(
-                    [
-                        ffmpeg, "-y", "-v", "error", "-f", "rawvideo",
-                        "-pix_fmt", "rgba", "-s:v", f"{width}x{height}", "-r", str(fps),
-                        "-i", "-", "-an", *_encoder_args(ffmpeg),
-                        "-pix_fmt", _output_pix_fmt(),
-                        *_color_args(info),
-                        str(silent_video),
-                    ],
-                    stdin=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                if encode.stdin is None:
-                    raise RuntimeError("Failed to create FFmpeg output pipe")
+                LOGGER.info("[TE DLSS5] native DLSSNR backend ready; frame pipeline=RGBA -> guidance -> DLSSNR Feature 18 -> %s",
+                            "H.264" if not frames_mode else "IMAGE batch")
+                if not frames_mode:
+                    encode = subprocess.Popen(
+                        [
+                            ffmpeg, "-y", "-v", "error", "-f", "rawvideo",
+                            "-pix_fmt", "rgba", "-s:v", f"{width}x{height}", "-r", str(fps),
+                            "-i", "-", "-an", *_encoder_args(ffmpeg),
+                            "-pix_fmt", _output_pix_fmt(),
+                            *_color_args(info),
+                            str(silent_video),
+                        ],
+                        stdin=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    if encode.stdin is None:
+                        raise RuntimeError("Failed to create FFmpeg output pipe")
+
+                def emit(processed: bytes):
+                    if frames_mode:
+                        frames_out.append(processed)
+                    else:
+                        encode.stdin.write(processed)
 
                 def process_frame(frame: bytes):
                     import numpy as np
@@ -495,8 +558,9 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                             raise RuntimeError("FFmpeg ended with a partial RGBA frame")
                         processed = process_frame(frame)
                         if processed is not None:
-                            encode.stdin.write(processed)
+                            emit(processed)
                         frame_count += 1
+                        progress.update_absolute(frame_count)
                         if frame_count == 1 or frame_count % 30 == 0:
                             LOGGER.info("[TE DLSS5] processed frame=%d", frame_count)
                 else:
@@ -511,15 +575,21 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                             raise RuntimeError("IMAGE frames must have 3 or 4 channels")
                         processed = process_frame(frame.tobytes())
                         if processed is not None:
-                            encode.stdin.write(processed)
+                            emit(processed)
                         frame_count += 1
+                        progress.update_absolute(frame_count)
                         if frame_count == 1 or frame_count % 30 == 0:
                             LOGGER.info("[TE DLSS5] processed frame=%d", frame_count)
                 while pending_native:
-                    encode.stdin.write(pending_native.popleft().result())
-                encode.stdin.close()
+                    emit(pending_native.popleft().result())
+                    progress.update_absolute(len(frames_out) if frames_mode else frame_count)
+                if not frames_mode:
+                    encode.stdin.close()
                 decode_ok = images is not None or decode.wait() == 0
-                encode_code = encode.wait()
+                if frames_mode:
+                    encode_code = 0
+                else:
+                    encode_code = encode.wait()
                 if not decode_ok or encode_code != 0:
                     details = []
                     for process in (decode, encode):
@@ -529,7 +599,8 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                                 details.append(message)
                     suffix = f": {' | '.join(details)}" if details else ""
                     raise RuntimeError(f"FFmpeg decode/encode failed{suffix}")
-                LOGGER.info("[TE DLSS5] video encode complete: frames=%d, file=%s", frame_count, silent_video)
+                LOGGER.info("[TE DLSS5] frame pipeline complete: frames=%d%s", frame_count,
+                            "" if frames_mode else f", file={silent_video}")
         finally:
             _stop_process(decode)
             _stop_process(encode)
@@ -539,7 +610,21 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                 ab_enhancer.close()
 
         if frame_count == 0:
-            raise RuntimeError("The input video contained no frames")
+            raise RuntimeError("The input contained no frames")
+
+        if frames_mode:
+            import numpy as np
+            import torch
+
+            batch = np.stack([
+                np.frombuffer(frame, dtype=np.uint8).reshape((height, width, 4))[..., :3]
+                for frame in frames_out
+            ])
+            tensor = torch.from_numpy(batch).float().div(255.0)
+            LOGGER.info("[TE DLSS5] job complete: frames=%d, shape=%s, output=in-memory IMAGE batch%s",
+                        frame_count, tuple(tensor.shape),
+                        "; audio input ignored in frames mode" if audio is not None else "")
+            return None, tensor, frame_count
 
         if images is not None and audio is not None:
             audio_wav = Path(temp_dir) / "audio.wav"
@@ -567,4 +652,4 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
             "[TE DLSS5] A/B summary: frames=%d mean_MAE=%.3f mean_PSNR=%.2f dB",
             len(ab_mae), sum(ab_mae) / len(ab_mae), sum(ab_psnr) / len(ab_psnr),
         )
-    return output
+    return output, None, frame_count

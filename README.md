@@ -6,7 +6,27 @@ https://pan.quark.cn/s/2d4816b6cd1f
 
 ## 版本
 
-当前版本：**1.0**
+当前版本：**1.1**
+
+## 1.1 更新内容
+
+- **输出模式 `output_mode`**：视频增强节点新增输出模式选择。
+  - `video`（默认）：与之前一致，FFmpeg 编码为视频文件，从 `video` 输出口输出 VIDEO 对象。
+  - `frames`：跳过 FFmpeg、跳过有损重编码，增强后的帧序列直接从 `frames` 输出口输出 IMAGE batch（float 0-1，RGB），可接入任意后续节点或自选编码器。此模式不需要安装 FFmpeg。注意：长视频/高分辨率下 IMAGE batch 内存占用较大。
+  - 两个输出口按模式二选一使用（未使用的输出口为空）。
+- **移除无效输入 `frame_count`**：该输入为历史遗留、从未参与任何计算（真实帧数始终取自 IMAGE batch 长度）。旧工作流里已连接的 frame_count 连线会被自动忽略，不影响加载。
+- **fps 来源提示**：帧率优先级为 `output_fps`（用户指定）> `video_info`（连接 VHS_VIDEOINFO 时自动读取）> 24fps 兜底。走到兜底时，状态字符串会明确标注 `fps=24 assumed`，避免输出视频帧率与源不一致导致音画不同步。
+- **逐帧进度**：处理过程中向 ComfyUI 界面上报进度条（帧数/总帧数）。文件输入模式下总帧数取自 ffprobe（nb_frames 或 duration×fps），不可得时不显示总进度。
+- **Runtime Info 诊断节点**：新增 `TE DLSS5 Runtime Info` 节点，一次性汇报 Python/torch/驱动、DLSSNR 桥接 DLL（含 SHA256）、NGX runtime 文件、NVOF DLL 与 `nvofapi64.dll` 可见性、CUDA toolkit 路径、深度模型可用性、FFmpeg 与编码器选择。设置环境变量 `TE_DLSS5_RUNTIME_INFO_DEEP=1` 后执行，会额外做一次真实 NVOF 创建+处理+销毁测试并验证 PyTorch CUDA 状态完好。
+- **NGX 错误码解释**：后端错误信息中出现 `0xBAD00001` / `0xBAD00002` 时自动附加人话解释（见下表）。
+- **CUDA 上下文安全**：修复 NVOF CUDA 桥接层把自身 CUDA 上下文遗留在调用线程上、导致任务结束后 PyTorch CUDA 状态损坏（`torch.cuda.empty_cache()` 报 `invalid argument`、ComfyUI prompt 线程崩溃）的问题。现在每次 NVOF 调用后都会恢复调用方上下文。
+
+### NGX 常见错误码
+
+| 错误码 | 含义 |
+| --- | --- |
+| `0xBAD00001` | NGX runtime 认为当前 GPU/驱动/runtime 组合不支持该特性 |
+| `0xBAD00002` | NGX runtime 拒绝了调用方/应用身份（caller 校验失败） |
 
 一个在 ComfyUI 中使用 NVIDIA DLSSNR 的视频画质处理节点，对视频逐帧执行同分辨率神经画质处理。利用 DLSSNR 对画面的纹理、局部结构、色调和时域稳定性进行处理。
 

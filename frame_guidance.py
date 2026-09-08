@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import ctypes
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -29,19 +30,40 @@ class GuidanceError(RuntimeError):
     """Raised when a requested guide cannot be produced."""
 
 
+def nvof_dll_candidates() -> list[Path]:
+    """Search order for the CUDA NVOF bridge, shared with diagnostics."""
+    configured = os.environ.get("TE_NVOF_DLL", "").strip()
+    root = Path(__file__).resolve().parent
+    candidates = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend((root / "te_nvof_cuda.dll", root / "native" / "te_nvof_cuda.dll"))
+    return candidates
+
+
+def cuda_bin_candidates() -> list[Path]:
+    """CUDA toolkit bin directories that may hold the NVOF SDK's DLL deps."""
+    roots = [os.environ.get("CUDA_PATH", "").strip(),
+             os.environ.get("CUDA_PATH_V13_1", "").strip(),
+             r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"]
+    bins = []
+    for cuda_root in roots:
+        if not cuda_root:
+            continue
+        cuda_bin = Path(cuda_root) / "bin"
+        if cuda_bin.is_dir():
+            bins.append(cuda_bin)
+            break
+    return bins
+
+
 class _CudaNvof:
     """Adapter for the official CUDA Optical Flow SDK bridge."""
 
     def __init__(self, width: int, height: int):
         if os.name != "nt":
             raise GuidanceError("CUDA NVOF guidance requires Windows")
-        root = Path(__file__).resolve().parent
-        candidates = []
-        configured = os.environ.get("TE_NVOF_DLL", "").strip()
-        if configured:
-            candidates.append(Path(configured))
-        candidates.extend((root / "te_nvof_cuda.dll", root / "native" / "te_nvof_cuda.dll"))
-        path = next((item for item in candidates if item.is_file()), None)
+        path = next((item for item in nvof_dll_candidates() if item.is_file()), None)
         if path is None:
             raise GuidanceError(
                 "CUDA NVOF bridge is not built; run native\\build_nvof.bat "
@@ -50,19 +72,11 @@ class _CudaNvof:
         try:
             self._dll_dirs = []
             if hasattr(os, "add_dll_directory"):
-                cuda_roots = [os.environ.get("CUDA_PATH", "").strip(),
-                              os.environ.get("CUDA_PATH_V13_1", "").strip(),
-                              r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"]
-                for cuda_root in cuda_roots:
-                    if not cuda_root:
-                        continue
-                    cuda_bin = Path(cuda_root) / "bin"
-                    if cuda_bin.is_dir():
-                        try:
-                            self._dll_dirs.append(os.add_dll_directory(str(cuda_bin)))
-                        except OSError:
-                            pass
-                        break
+                for cuda_bin in cuda_bin_candidates():
+                    try:
+                        self._dll_dirs.append(os.add_dll_directory(str(cuda_bin)))
+                    except OSError:
+                        pass
             self.dll = ctypes.WinDLL(str(path))
             self.create = self._bind("te_nvof_create", ctypes.c_void_p,
                                      [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p])
@@ -78,9 +92,30 @@ class _CudaNvof:
             if self.last_error is not None:
                 self.last_error.restype = ctypes.c_char_p
                 self.last_error.argtypes = []
-            self.handle = self.create(width, height, b"{}")
+            # The NVOF bridge sets its own CUDA context current on the calling
+            # thread and leaves it current when its functions return. If
+            # PyTorch runs CUDA work in that window (the depth model in
+            # nvof_depth mode does so on every inference frame), context-bound
+            # CUDA library state such as cuBLAS handles binds to the NVOF
+            # context. te_nvof_destroy later destroys that context, and every
+            # subsequent torch CUDA call in the process fails (observed as
+            # ComfyUI's torch.cuda.empty_cache() raising cudaErrorInvalidValue
+            # and the prompt worker thread dying). Restore the caller's
+            # context around every bridge call so torch never runs inside the
+            # bridge's context.
+            self._nvcuda = ctypes.WinDLL("nvcuda.dll")
+            self._cu_ctx_get_current = self._nvcuda.cuCtxGetCurrent
+            self._cu_ctx_get_current.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            self._cu_ctx_get_current.restype = ctypes.c_int
+            self._cu_ctx_set_current = self._nvcuda.cuCtxSetCurrent
+            self._cu_ctx_set_current.argtypes = [ctypes.c_void_p]
+            self._cu_ctx_set_current.restype = ctypes.c_int
+            with self._caller_context_restored():
+                self.handle = self.create(width, height, b"{}")
         except (AttributeError, OSError) as exc:
-            raise GuidanceError(f"Could not load CUDA NVOF bridge {path}: {exc}") from exc
+            raise GuidanceError(
+                f"Could not load CUDA NVOF bridge {path} or the CUDA driver (nvcuda.dll): {exc}"
+            ) from exc
         if not self.handle:
             detail = ""
             if self.last_error is not None:
@@ -93,7 +128,8 @@ class _CudaNvof:
         details = ""
         if self.info_fn is not None:
             try:
-                details = (self.info_fn(self.handle) or b"").decode("utf-8", "replace")
+                with self._caller_context_restored():
+                    details = (self.info_fn(self.handle) or b"").decode("utf-8", "replace")
             except Exception:
                 details = ""
         LOGGER.info("[TE DLSS5] NVOF ready: dll=%s, size=%sx%s%s", path, width, height,
@@ -108,11 +144,35 @@ class _CudaNvof:
         fn.argtypes = argtypes
         return fn
 
+    @contextmanager
+    def _caller_context_restored(self):
+        """Run one bridge call without leaking the bridge's CUDA context.
+
+        The bridge sets its own context current per call; restoring the
+        context that was current on entry keeps subsequent PyTorch work on
+        torch's context. cuCtxSetCurrent(NULL) detaches, matching a thread
+        that had no context before the call.
+        """
+        saved = ctypes.c_void_p()
+        if self._cu_ctx_get_current(ctypes.byref(saved)) != 0:
+            saved = ctypes.c_void_p()
+        try:
+            yield
+        finally:
+            result = self._cu_ctx_set_current(saved)
+            if result != 0:
+                LOGGER.warning(
+                    "[TE DLSS5] restoring the caller CUDA context after an NVOF "
+                    "call failed (CUresult=%d); subsequent PyTorch CUDA work "
+                    "may run in the wrong context", result,
+                )
+
     def next(self, frame: bytes):
         src = ctypes.create_string_buffer(frame)
         motion = ctypes.create_string_buffer(self.guide_bytes)
         confidence = ctypes.create_string_buffer(self.confidence_bytes)
-        status = self.process(self.handle, src, motion, confidence, self.frame_bytes)
+        with self._caller_context_restored():
+            status = self.process(self.handle, src, motion, confidence, self.frame_bytes)
         if status != 0:
             detail = ""
             if self.last_error is not None:
@@ -122,11 +182,13 @@ class _CudaNvof:
 
     def reset(self):
         if self.handle:
-            self.reset_fn(self.handle)
+            with self._caller_context_restored():
+                self.reset_fn(self.handle)
 
     def close(self):
         if getattr(self, "handle", None):
-            self.destroy(self.handle)
+            with self._caller_context_restored():
+                self.destroy(self.handle)
             self.handle = None
         for handle in getattr(self, "_dll_dirs", []):
             handle.close()
