@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import os
 import ctypes
+import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +34,8 @@ class GuidanceError(RuntimeError):
 class _CudaNvof:
     """Adapter for the official CUDA Optical Flow SDK bridge."""
 
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int, adapter_luid: str = "",
+                 guidance: str = "", shared_resources: bool = False):
         if os.name != "nt":
             raise GuidanceError("CUDA NVOF guidance requires Windows")
         root = Path(__file__).resolve().parent
@@ -56,18 +59,33 @@ class _CudaNvof:
                 for cuda_root in cuda_roots:
                     if not cuda_root:
                         continue
-                    cuda_bin = Path(cuda_root) / "bin"
-                    if cuda_bin.is_dir():
-                        try:
-                            self._dll_dirs.append(os.add_dll_directory(str(cuda_bin)))
-                        except OSError:
-                            pass
-                        break
+                    for cuda_bin in (Path(cuda_root) / "bin", Path(cuda_root) / "bin" / "x64"):
+                        if cuda_bin.is_dir():
+                            try:
+                                self._dll_dirs.append(os.add_dll_directory(str(cuda_bin)))
+                            except OSError:
+                                pass
             self.dll = ctypes.WinDLL(str(path))
             self.create = self._bind("te_nvof_create", ctypes.c_void_p,
                                      [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p])
             self.process = self._bind("te_nvof_process_rgba", ctypes.c_int,
                                       [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32])
+            self.attach_shared_fn = getattr(self.dll, "te_nvof_attach_d3d12_slot", None)
+            self.process_shared_fn = getattr(self.dll, "te_nvof_process_rgba_shared", None)
+            self.shared_abi_ready = self.attach_shared_fn is not None and self.process_shared_fn is not None
+            if self.shared_abi_ready:
+                self.attach_shared_fn.restype = ctypes.c_int
+                self.attach_shared_fn.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64,
+                    ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p,
+                ]
+                self.process_shared_fn.restype = ctypes.c_int
+                self.process_shared_fn.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_uint32,
+                ]
             self.reset_fn = self._bind("te_nvof_reset", None, [ctypes.c_void_p])
             self.destroy = self._bind("te_nvof_destroy", None, [ctypes.c_void_p])
             self.info_fn = getattr(self.dll, "te_nvof_info", None)
@@ -78,7 +96,16 @@ class _CudaNvof:
             if self.last_error is not None:
                 self.last_error.restype = ctypes.c_char_p
                 self.last_error.argtypes = []
-            self.handle = self.create(width, height, b"{}")
+            create_settings = {}
+            if adapter_luid:
+                create_settings["adapterLuid"] = adapter_luid
+            if guidance:
+                create_settings["guidance"] = str(guidance)
+            if shared_resources:
+                create_settings["sharedResources"] = True
+            self.handle = self.create(
+                width, height, json.dumps(create_settings).encode("ascii")
+            )
         except (AttributeError, OSError) as exc:
             raise GuidanceError(f"Could not load CUDA NVOF bridge {path}: {exc}") from exc
         if not self.handle:
@@ -101,6 +128,7 @@ class _CudaNvof:
         self.frame_bytes = width * height * 4
         self.guide_bytes = width * height * 4
         self.confidence_bytes = width * height
+        self.shared_slots = set()
 
     def _bind(self, name, restype, argtypes):
         fn = getattr(self.dll, name)
@@ -118,6 +146,45 @@ class _CudaNvof:
             if self.last_error is not None:
                 detail = (self.last_error() or b"").decode("utf-8", "replace")
             raise GuidanceError(f"CUDA NVOF frame processing failed ({status}){': ' + detail if detail else ''}")
+        return motion.raw, confidence.raw
+
+    def attach_shared_slot(self, slot_index: int, handles: dict,
+                           resource_info: dict) -> None:
+        if not self.shared_abi_ready:
+            raise GuidanceError("CUDA NVOF DLL lacks D3D12 shared-resource ABI")
+        sizes = resource_info["allocation_sizes"]
+        status = self.attach_shared_fn(
+            self.handle, ctypes.c_uint32(slot_index),
+            handles["color"], ctypes.c_uint64(sizes[0]),
+            handles["motion"], ctypes.c_uint64(sizes[2]),
+            handles["producer_fence"],
+        )
+        if status != 0:
+            detail = (self.last_error() or b"").decode("utf-8", "replace") if self.last_error else ""
+            raise GuidanceError(
+                f"CUDA NVOF D3D12 slot attach failed ({status})"
+                f"{': ' + detail if detail else ''}"
+            )
+        self.shared_slots.add(int(slot_index))
+
+    def next_shared(self, frame: bytes, slot_index: int,
+                    producer_fence_value: int):
+        if slot_index not in self.shared_slots:
+            raise GuidanceError(f"CUDA NVOF shared slot {slot_index} is not attached")
+        src = ctypes.create_string_buffer(frame)
+        motion = ctypes.create_string_buffer(self.guide_bytes)
+        confidence = ctypes.create_string_buffer(self.confidence_bytes)
+        status = self.process_shared_fn(
+            self.handle, ctypes.c_uint32(slot_index),
+            ctypes.c_uint64(producer_fence_value), src, motion, confidence,
+            ctypes.c_uint32(self.frame_bytes),
+        )
+        if status != 0:
+            detail = (self.last_error() or b"").decode("utf-8", "replace") if self.last_error else ""
+            raise GuidanceError(
+                f"CUDA NVOF shared frame failed ({status})"
+                f"{': ' + detail if detail else ''}"
+            )
         return motion.raw, confidence.raw
 
     def reset(self):
@@ -437,7 +504,9 @@ def _create_depth_model(runtime_dir: Path):
 class FrameGuidance:
     """Stateful guide producer for one sequential video stream."""
 
-    def __init__(self, width: int, height: int, mode: str, runtime_dir: str, depth_interval: int = 4):
+    def __init__(self, width: int, height: int, mode: str, runtime_dir: str,
+                 depth_interval: int = 4, adapter_luid: str = "",
+                 shared_resources: bool = False):
         self.width = int(width)
         self.height = int(height)
         self.mode = mode or "zero"
@@ -449,12 +518,24 @@ class FrameGuidance:
         self._depth_history_weight = 0.0
         self._reset_required = False
         self.frame_index = 0
+        self._motion_seconds = 0.0
+        self._depth_seconds = 0.0
+        self._depth_inference_seconds = 0.0
+        self._depth_reuse_seconds = 0.0
+        self._depth_inference_count = 0
+        self._depth_reuse_count = 0
         self.depth_model = None
         if self.mode not in {"zero", "motion", "depth", "motion_depth", "nvof", "nvof_depth"}:
             raise GuidanceError(f"Unknown guidance mode: {self.mode}")
         self.nvof = None
         try:
-            self.nvof = _CudaNvof(width, height) if self.mode.startswith("nvof") else None
+            self.nvof = (
+                _CudaNvof(
+                    width, height, adapter_luid, self.mode,
+                    shared_resources,
+                )
+                if self.mode.startswith("nvof") else None
+            )
             if "depth" in self.mode:
                 self.depth_model = _create_depth_model(self.runtime_dir)
         except Exception:
@@ -469,6 +550,16 @@ class FrameGuidance:
             "NVOF cost-derived R8" if self.nvof else "disabled",
             self.depth_interval,
         )
+
+    @property
+    def shared_abi_ready(self) -> bool:
+        return bool(self.nvof is not None and self.nvof.shared_abi_ready)
+
+    def attach_shared_slot(self, slot_index: int, handles: dict,
+                           resource_info: dict) -> None:
+        if self.nvof is None:
+            raise GuidanceError("Shared D3D12 guidance requires CUDA NVOF mode")
+        self.nvof.attach_shared_slot(slot_index, handles, resource_info)
 
     def _motion(self, rgb):
         np = _load_numpy()
@@ -529,6 +620,7 @@ class FrameGuidance:
         # temporal optimization used by real-time preprocessors. Interval 1
         # preserves the original per-frame behavior.
         if warped is not None and self.frame_index % self.depth_interval != 0:
+            reuse_started = time.perf_counter()
             # Do not replicate history from outside the image after a large
             # motion vector. Invalid samples are neutralized instead of
             # smearing the last border pixel across a disocclusion.
@@ -537,9 +629,16 @@ class FrameGuidance:
             self._depth_residual_mean = 0.0
             self._depth_history_weight = float(np.mean(valid)) if valid is not None else 1.0
             self.previous_depth = warped.astype(np.float32)
+            self._depth_reuse_count += 1
+            self._depth_reuse_seconds += time.perf_counter() - reuse_started
             return self.previous_depth
 
-        current = self.depth_model.run(rgb)
+        inference_started = time.perf_counter()
+        try:
+            current = self.depth_model.run(rgb)
+        finally:
+            self._depth_inference_seconds += time.perf_counter() - inference_started
+            self._depth_inference_count += 1
         if warped is not None:
             if valid is not None:
                 warped = np.where(valid, warped, 0.0)
@@ -570,7 +669,8 @@ class FrameGuidance:
         self.previous_depth = current
         return current.astype(np.float32)
 
-    def next(self, rgba: Any) -> tuple[bytes | None, bytes | None]:
+    def next(self, rgba: Any, shared_slot: int | None = None,
+             producer_fence_value: int = 0) -> tuple[bytes | None, bytes | None]:
         np = _load_numpy()
         frame = np.asarray(rgba)
         if frame.shape != (self.height, self.width, 4):
@@ -595,11 +695,19 @@ class FrameGuidance:
                     self.previous_depth = None
                     self._reset_required = True
             self.previous_gray = gray
-            motion_bytes, confidence_bytes = self.nvof.next(frame.tobytes(order="C"))
+            frame_bytes = frame.tobytes(order="C")
+            motion_started = time.perf_counter()
+            try:
+                if shared_slot is None:
+                    motion_bytes, confidence_bytes = self.nvof.next(frame_bytes)
+                else:
+                    motion_bytes, confidence_bytes = self.nvof.next_shared(
+                        frame_bytes, shared_slot, producer_fence_value,
+                    )
+            finally:
+                self._motion_seconds += time.perf_counter() - motion_started
             motion = np.frombuffer(motion_bytes, dtype=np.float16).reshape((self.height, self.width, 2))
             # The native bridge returns confidence as a packed R8 byte plane.
-            # Decode it before depth fusion; passing the raw bytes to NumPy's
-            # float conversion makes it try to parse the entire image buffer.
             confidence = np.frombuffer(confidence_bytes, dtype=np.uint8).reshape((self.height, self.width))
             if self.frame_index == 1 or self.frame_index % 30 == 0:
                 LOGGER.info(
@@ -612,7 +720,11 @@ class FrameGuidance:
             motion = self._motion(rgb) if "motion" in self.mode else None
             if motion is not None and (self.frame_index == 1 or self.frame_index % 30 == 0):
                 LOGGER.info("[TE DLSS5] frame=%d motion=OpenCV Farneback ok", self.frame_index)
-        depth = self._depth(rgb, motion, confidence) if "depth" in self.mode else None
+        depth_started = time.perf_counter()
+        try:
+            depth = self._depth(rgb, motion, confidence) if "depth" in self.mode else None
+        finally:
+            self._depth_seconds += time.perf_counter() - depth_started
         if depth is not None and (self.frame_index == 1 or self.frame_index % 30 == 0):
             depth_phase = "inference" if self.frame_index == 1 or self.frame_index % self.depth_interval == 0 else "warped_reuse"
             LOGGER.info(
@@ -620,6 +732,26 @@ class FrameGuidance:
                 self.frame_index, depth_phase, float(depth.min()), float(depth.max()), float(depth.mean()),
                 self._depth_residual_mean, self._depth_history_weight,
             )
+        if self.frame_index == 1 or self.frame_index % 30 == 0:
+            LOGGER.info(
+                "[TE DLSS5] guidance timing avg/frame: motion=%.2fms depth=%.2fms",
+                self._motion_seconds * 1000.0 / self.frame_index,
+                self._depth_seconds * 1000.0 / self.frame_index,
+            )
+            if self._depth_inference_count or self._depth_reuse_count:
+                inference_avg = (
+                    self._depth_inference_seconds * 1000.0 / self._depth_inference_count
+                    if self._depth_inference_count else 0.0
+                )
+                reuse_avg = (
+                    self._depth_reuse_seconds * 1000.0 / self._depth_reuse_count
+                    if self._depth_reuse_count else 0.0
+                )
+                LOGGER.info(
+                    "[TE DLSS5] depth timing: inference=%d avg=%.2fms, reuse=%d avg=%.2fms",
+                    self._depth_inference_count, inference_avg,
+                    self._depth_reuse_count, reuse_avg,
+                )
         return (
             motion.tobytes(order="C") if motion is not None else None,
             depth.tobytes(order="C") if depth is not None else None,

@@ -16,6 +16,27 @@ class NativeBackendError(RuntimeError):
     pass
 
 
+class _SharedResourceInfo(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("slot_count", ctypes.c_uint32),
+        ("color_format", ctypes.c_uint32),
+        ("output_format", ctypes.c_uint32),
+        ("motion_format", ctypes.c_uint32),
+        ("depth_format", ctypes.c_uint32),
+        ("color_allocation_size", ctypes.c_uint64),
+        ("output_allocation_size", ctypes.c_uint64),
+        ("motion_allocation_size", ctypes.c_uint64),
+        ("depth_allocation_size", ctypes.c_uint64),
+        ("adapter_luid", ctypes.c_uint8 * 8),
+        ("adapter_node_mask", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
 class NativeEnhancer:
     """Small ABI adapter for the TE D3D12/NGX bridge.
 
@@ -51,8 +72,69 @@ class NativeEnhancer:
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
             ]
+        self._submit = getattr(self._dll, "te_nr_submit_rgba_guided", None)
+        self._collect = getattr(self._dll, "te_nr_collect_rgba", None)
+        self._collect_nowait = getattr(self._dll, "te_nr_collect_rgba_nowait", None)
+        self._flush = getattr(self._dll, "te_nr_flush", None)
+        self._shared_query = getattr(self._dll, "te_nr_get_shared_resources", None)
+        self._shared_query_v2 = getattr(self._dll, "te_nr_get_shared_resources_v2", None)
+        self._shared_info_query = getattr(self._dll, "te_nr_get_shared_resource_info", None)
+        self._submit_shared = getattr(self._dll, "te_nr_submit_shared_guided", None)
+        self.shared_interop_ready = False
+        self.shared_resource_info = None
+        if self._shared_query is not None:
+            self._shared_query.restype = ctypes.c_int
+            self._shared_query.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+        if self._shared_info_query is not None:
+            self._shared_info_query.restype = ctypes.c_int
+            self._shared_info_query.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(_SharedResourceInfo),
+            ]
+        if self._shared_query_v2 is not None:
+            self._shared_query_v2.restype = ctypes.c_int
+            self._shared_query_v2.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32,
+                *(ctypes.POINTER(ctypes.c_void_p) for _ in range(6)),
+            ]
+        if self._submit_shared is not None:
+            self._submit_shared.restype = ctypes.c_int
+            self._submit_shared.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64,
+                ctypes.c_void_p, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+        self.async_ready = all(
+            fn is not None for fn in (self._submit, self._collect, self._collect_nowait, self._flush)
+        )
+        if self.async_ready:
+            self._submit.restype = ctypes.c_int
+            self._submit.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64),
+            ]
+            for fn in (self._collect, self._collect_nowait):
+                fn.restype = ctypes.c_int
+                fn.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32,
+                ]
+            self._flush.restype = ctypes.c_int
+            self._flush.argtypes = [ctypes.c_void_p]
+        elif any(fn is not None for fn in (self._submit, self._collect, self._collect_nowait, self._flush)):
+            LOGGER.warning("[TE DLSS5] native async ABI is incomplete; using synchronous frame processing")
         self._reset = self._bind("te_nr_reset", None, [ctypes.c_void_p])
         self._destroy = self._bind("te_nr_destroy", None, [ctypes.c_void_p])
+        self._info = getattr(self._dll, "te_nr_info", None)
+        if self._info is not None:
+            self._info.restype = ctypes.c_char_p
+            self._info.argtypes = [ctypes.c_void_p]
         self._last_error = getattr(self._dll, "te_nr_last_error", None)
         if self._last_error is not None:
             self._last_error.restype = ctypes.c_char_p
@@ -72,6 +154,15 @@ class NativeEnhancer:
         self.frame_bytes = width * height * 4
         self._frame_index = 0
         LOGGER.info("[TE DLSS5] DLSSNR native bridge ready: dll=%s, feature=18, size=%sx%s", path, width, height)
+        LOGGER.info("[TE DLSS5] native frame queue: %s", "3-slot async" if self.async_ready else "synchronous fallback")
+        if self._info is not None:
+            try:
+                details = (self._info(self._handle) or b"").decode("utf-8", "replace")
+                if details:
+                    LOGGER.info("[TE DLSS5] DLSSNR parameters accepted by native bridge: %s", details)
+            except Exception:
+                pass
+        self._probe_shared_resources()
 
     def _bind(self, name, restype, argtypes):
         try:
@@ -81,6 +172,137 @@ class NativeEnhancer:
         fn.restype = restype
         fn.argtypes = argtypes
         return fn
+
+    @staticmethod
+    def _close_shared_handle(handle: ctypes.c_void_p) -> None:
+        """Close a Windows HANDLE returned by the probe ABI."""
+        value = handle.value if isinstance(handle, ctypes.c_void_p) else int(handle or 0)
+        if not value or os.name != "nt":
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.CloseHandle(ctypes.c_void_p(value))
+        except (AttributeError, OSError):
+            LOGGER.warning("[TE DLSS5] could not close a shared resource probe handle")
+
+    def _probe_shared_resources(self) -> None:
+        """Validate that the native bridge can export shared D3D12 handles.
+
+        This first query is intentionally short-lived. The video scheduler
+        later exports all three v2 slots and hands them to CUDA NVOF when both
+        native DLLs expose the complete producer/consumer Fence ABI.
+        """
+        if self._shared_query is None:
+            LOGGER.info("[TE DLSS5] shared D3D12 resources: ABI unavailable (CPU staging active)")
+            return
+        handles = [ctypes.c_void_p() for _ in range(5)]
+        info = _SharedResourceInfo()
+        info.struct_size = ctypes.sizeof(_SharedResourceInfo)
+        info_result = (
+            self._shared_info_query(self._handle, ctypes.byref(info))
+            if self._shared_info_query is not None else 50
+        )
+        result = self._shared_query(
+            self._handle,
+            ctypes.c_uint32(0),
+            *(ctypes.byref(handle) for handle in handles),
+        )
+        try:
+            self.shared_interop_ready = result == 0 and all(handle.value for handle in handles)
+            if self.shared_interop_ready:
+                if info_result == 0:
+                    luid = bytes(info.adapter_luid).hex()
+                    self.shared_resource_info = {
+                        "version": int(info.version),
+                        "width": int(info.width),
+                        "height": int(info.height),
+                        "slot_count": int(info.slot_count),
+                        "formats": (
+                            int(info.color_format), int(info.output_format),
+                            int(info.motion_format), int(info.depth_format),
+                        ),
+                        "allocation_sizes": (
+                            int(info.color_allocation_size), int(info.output_allocation_size),
+                            int(info.motion_allocation_size), int(info.depth_allocation_size),
+                        ),
+                        "adapter_luid": luid,
+                        "adapter_node_mask": int(info.adapter_node_mask),
+                    }
+                else:
+                    luid = "unknown"
+                LOGGER.info(
+                    "[TE DLSS5] shared D3D12 resources: export probe ready "
+                    "(actual DLSSNR textures+fence, slots=%s, adapter_luid=%s; "
+                    "awaiting CUDA NVOF attachment)",
+                    info.slot_count if info_result == 0 else "unknown",
+                    luid,
+                )
+            elif result == 50:  # ERROR_NOT_SUPPORTED: opt-in switch is off.
+                LOGGER.info("[TE DLSS5] shared D3D12 resources: disabled (CPU staging active)")
+            else:
+                LOGGER.warning("[TE DLSS5] shared D3D12 resources: probe failed (%s)", result)
+        finally:
+            for handle in handles:
+                self._close_shared_handle(handle)
+
+    def export_shared_slot(self, slot_index: int) -> dict:
+        """Return duplicated v2 handles for one slot; caller must close them."""
+        if not self.shared_interop_ready or self._shared_query_v2 is None:
+            raise NativeBackendError("Native bridge lacks shared D3D12 v2 ABI")
+        handles = [ctypes.c_void_p() for _ in range(6)]
+        result = self._shared_query_v2(
+            self._handle, ctypes.c_uint32(slot_index),
+            *(ctypes.byref(handle) for handle in handles),
+        )
+        if result != 0:
+            for handle in handles:
+                self._close_shared_handle(handle)
+            raise NativeBackendError(
+                f"Could not export shared D3D12 slot {slot_index} ({result})"
+            )
+        names = (
+            "color", "output", "motion", "depth",
+            "producer_fence", "consumer_fence",
+        )
+        return {name: handle for name, handle in zip(names, handles)}
+
+    def close_shared_slot_handles(self, handles: dict) -> None:
+        for handle in handles.values():
+            self._close_shared_handle(handle)
+
+    @property
+    def shared_submit_ready(self) -> bool:
+        return (
+            self.shared_interop_ready and self._shared_query_v2 is not None and
+            self._submit_shared is not None and self.shared_resource_info is not None
+        )
+
+    def submit_shared(self, slot_index: int, producer_fence_value: int,
+                      depth: bytes | None = None) -> int:
+        if not self.shared_submit_ready:
+            raise NativeBackendError("Native bridge shared submission ABI is unavailable")
+        expected = self.width * self.height * 4
+        if depth is not None and len(depth) != expected:
+            raise NativeBackendError(f"Unexpected depth guide size {len(depth)}; expected {expected}")
+        depth_buf = ctypes.create_string_buffer(depth) if depth is not None else None
+        token = ctypes.c_uint64(0)
+        result = self._submit_shared(
+            self._handle, ctypes.c_uint32(slot_index),
+            ctypes.c_uint64(producer_fence_value), depth_buf,
+            ctypes.c_uint32(len(depth) if depth is not None else 0),
+            ctypes.byref(token),
+        )
+        if result != 0:
+            raise NativeBackendError(f"Native shared DLSSNR submit failed ({result})")
+        self._frame_index += 1
+        if self._frame_index == 1 or self._frame_index % 30 == 0:
+            LOGGER.info(
+                "[TE DLSS5] frame=%d DLSSNR shared-texture submit ok slot=%d fence=%d",
+                self._frame_index, slot_index, producer_fence_value,
+            )
+        return int(token.value)
 
     def process(self, frame: bytes, motion: bytes | None = None, depth: bytes | None = None) -> bytes:
         if len(frame) != self.frame_bytes:
@@ -118,12 +340,63 @@ class NativeEnhancer:
             )
         return dst.raw
 
+    def submit(self, frame: bytes, motion: bytes | None = None, depth: bytes | None = None) -> int:
+        """Queue one guided frame and return its native opaque token."""
+        if not self.async_ready:
+            raise NativeBackendError("Native bridge lacks asynchronous ABI; rebuild the DLL")
+        if len(frame) != self.frame_bytes:
+            raise NativeBackendError(
+                f"Unexpected RGBA frame size {len(frame)}; expected {self.frame_bytes}"
+            )
+        expected = self.width * self.height * 4
+        if motion is not None and len(motion) != expected:
+            raise NativeBackendError(f"Unexpected motion guide size {len(motion)}; expected {expected}")
+        if depth is not None and len(depth) != expected:
+            raise NativeBackendError(f"Unexpected depth guide size {len(depth)}; expected {expected}")
+        src = ctypes.create_string_buffer(frame)
+        motion_buf = ctypes.create_string_buffer(motion) if motion is not None else None
+        depth_buf = ctypes.create_string_buffer(depth) if depth is not None else None
+        token = ctypes.c_uint64(0)
+        result = self._submit(
+            self._handle, src, motion_buf, depth_buf,
+            ctypes.c_uint32(self.frame_bytes), ctypes.byref(token),
+        )
+        if result != 0:
+            raise NativeBackendError(f"Native TE DLSS5 frame submit failed ({result})")
+        self._frame_index += 1
+        if self._frame_index == 1 or self._frame_index % 30 == 0:
+            LOGGER.info("[TE DLSS5] frame=%d DLSSNR Feature 18 submit ok (async)", self._frame_index)
+        return int(token.value)
+
+    def collect(self, token: int, *, wait: bool = True) -> bytes:
+        """Collect one queued frame, waiting unless ``wait`` is false."""
+        if not self.async_ready:
+            raise NativeBackendError("Native bridge lacks asynchronous ABI; rebuild the DLL")
+        dst = ctypes.create_string_buffer(self.frame_bytes)
+        fn = self._collect if wait else self._collect_nowait
+        result = fn(self._handle, ctypes.c_uint64(token), dst, ctypes.c_uint32(self.frame_bytes))
+        if result != 0:
+            raise NativeBackendError(f"Native TE DLSS5 frame collect failed ({result})")
+        return dst.raw
+
+    def flush(self):
+        """Wait for all native in-flight slots and release their tokens."""
+        if self.async_ready and getattr(self, "_handle", None):
+            result = self._flush(self._handle)
+            if result != 0:
+                raise NativeBackendError(f"Native TE DLSS5 queue flush failed ({result})")
+
     def reset(self):
         self._reset(self._handle)
         LOGGER.info("[TE DLSS5] DLSSNR temporal history reset")
 
     def close(self):
         if getattr(self, "_handle", None):
+            if self.async_ready:
+                try:
+                    self.flush()
+                except NativeBackendError as exc:
+                    LOGGER.warning("[TE DLSS5] native queue flush during close failed: %s", exc)
             self._destroy(self._handle)
             self._handle = None
             LOGGER.info("[TE DLSS5] DLSSNR native bridge closed after %d frame(s)", getattr(self, "_frame_index", 0))
@@ -179,6 +452,7 @@ def describe_backend(explicit: str = "") -> str:
     if os.name != "nt":
         return f"TE DLSS5 backend: {target} (Windows DLL; current OS is unsupported)"
     guided = False
+    async_abi = False
     load_error = ""
     dll_dir_handle = None
     try:
@@ -187,6 +461,15 @@ def describe_backend(explicit: str = "") -> str:
             dll_dir_handle = os.add_dll_directory(str(runtime_dir))
         loaded = ctypes.WinDLL(str(target))
         guided = getattr(loaded, "te_nr_process_rgba_guided", None) is not None
+        async_abi = all(
+            getattr(loaded, name, None) is not None
+            for name in (
+                "te_nr_submit_rgba_guided",
+                "te_nr_collect_rgba",
+                "te_nr_collect_rgba_nowait",
+                "te_nr_flush",
+            )
+        )
     except (AttributeError, OSError) as exc:
         load_error = f"; load error={exc}"
     finally:
@@ -200,5 +483,6 @@ def describe_backend(explicit: str = "") -> str:
         )
     return (
         f"TE DLSS5 backend: configured: {target}; guided ABI=ready; "
+        f"async ABI={'ready' if async_abi else 'missing (sync fallback)'}; "
         f"NGX runtime={'found' if runtime_file.is_file() else 'missing'} at {runtime_file}"
     )

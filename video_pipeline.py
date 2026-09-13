@@ -8,14 +8,16 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
 
 from .native_backend import NativeEnhancer, NativeBackendError, resolve_backend, resolve_runtime_dir
+from .native_sr_backend import NativeSuperResolution, NativeSRBackendError, resolve_sr_backend
 from .frame_guidance import FrameGuidance, GuidanceError
 
 
@@ -83,12 +85,17 @@ class VideoJob:
     intensity: float
     local_tone: float
     local_structure: float
+    nr_preset: int
+    skin_structure_strength: float
+    automatic_mask: bool
+    ui_correction: bool
     guidance: str
     depth_interval: int
     output_fps: float
     backend_dll: str
     runtime_dir: str
     overwrite: bool
+    scale: int = 1
 
 
 def _run(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess:
@@ -250,6 +257,11 @@ def _stop_process(process) -> None:
 
 
 def _settings(job: VideoJob) -> dict:
+    shared_requested = (
+        job.guidance.startswith("nvof") and
+        os.environ.get("TE_DLSS5_SHARED_RESOURCES", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     return {
         "style": job.style,
         # DLSSNR's runtime accepts the same -1..2 tuning range as the
@@ -258,9 +270,14 @@ def _settings(job: VideoJob) -> dict:
         "intensity": max(-1.0, min(2.0, job.intensity)),
         "localToneStrength": max(-1.0, min(2.0, job.local_tone)),
         "localStructureStrength": max(-1.0, min(2.0, job.local_structure)),
+        "nrPreset": max(0, min(3, int(job.nr_preset))),
+        "skinStructureStrength": max(-1.0, min(2.0, job.skin_structure_strength)),
+        "automaticMask": bool(job.automatic_mask),
+        "uiCorrection": bool(job.ui_correction),
         "guidance": job.guidance,
         "depthInterval": max(1, int(job.depth_interval)),
         "runtimeDir": str(resolve_runtime_dir(job.runtime_dir)),
+        "sharedResources": shared_requested,
     }
 
 
@@ -366,6 +383,20 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
         source_fps = 0.0
         source_fps = _video_info_fps(video_info)
         info = {}
+    scale = int(job.scale) if int(job.scale) in (1, 2, 4) else 1
+    source_width, source_height = width, height
+    if scale == 1:
+        width, height = source_width, source_height
+    else:
+        # 2x/4x targets are even for yuv420 encoders; 1x must preserve the
+        # original dimensions exactly for backward compatibility.
+        width = max(2, (source_width * scale) // 2 * 2)
+        height = max(2, (source_height * scale) // 2 * 2)
+    if scale != 1:
+        LOGGER.info(
+            "[TE DLSS5] spatial scale=%dx: %dx%d -> %dx%d (native DLSS SR before DLSSNR)",
+            scale, source_width, source_height, width, height,
+        )
     fps = job.output_fps if job.output_fps > 0 else source_fps
     if fps <= 0:
         # IMAGE batches do not carry timing metadata.  Keep the node usable
@@ -374,13 +405,18 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
 
     settings = _settings(job)
     output = _output_path(job)
-    frame_size = width * height * 4
     LOGGER.info(
-        "[TE DLSS5] job start: guidance=%s, size=%sx%s, fps=%.3f, depth_interval=%d, style=%s, intensity=%.3f, local_tone=%.3f, local_structure=%.3f",
+        "[TE DLSS5] job start: guidance=%s, size=%sx%s, fps=%.3f, depth_interval=%d, style=%s, intensity=%.3f, local_tone=%.3f, local_structure=%.3f, nr_preset=%d, skin_structure=%.3f, auto_mask=%s, ui_correction=%s",
         job.guidance, width, height, fps, max(1, int(job.depth_interval)), job.style, settings["intensity"],
-        settings["localToneStrength"], settings["localStructureStrength"],
+        settings["localToneStrength"], settings["localStructureStrength"], settings["nrPreset"],
+        settings["skinStructureStrength"], settings["automaticMask"], settings["uiCorrection"],
     )
     LOGGER.info("[TE DLSS5] backend=%s, runtime=%s, output=%s", backend_path, settings["runtimeDir"], output)
+    sr_backend = resolve_sr_backend() if scale != 1 else None
+    if scale != 1 and not sr_backend:
+        raise NativeSRBackendError(
+            "Native DLSS SR bridge is not installed. Build native\\te_dlss_sr_native.dll before selecting 2x/4x."
+        )
 
     with tempfile.TemporaryDirectory(prefix="te_dlss5_") as temp_dir:
         silent_video = Path(temp_dir) / "video_only.mp4"
@@ -390,13 +426,52 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
         ab_enabled = os.environ.get("TE_DLSS5_AB_TEST", "").strip().lower() in {"1", "true", "yes", "on"}
         ab_mae = []
         ab_psnr = []
-        async_executor = None
         pending_native = deque()
         frame_count = 0
+        timing = {
+            "decode": 0.0,
+            "sr": 0.0,
+            "guidance": 0.0,
+            "submit": 0.0,
+            "collect": 0.0,
+            "encode_write": 0.0,
+        }
         try:
-            with FrameGuidance(width, height, job.guidance, settings["runtimeDir"], job.depth_interval) as guidance, NativeEnhancer(
-                backend_path, width, height, settings
-            ) as enhancer:
+            sr_context = NativeSuperResolution(
+                sr_backend, source_width, source_height, width, height, settings["runtimeDir"]
+            ) if sr_backend else None
+            with (sr_context or nullcontext()) as sr, NativeEnhancer(backend_path, width, height, settings) as enhancer, FrameGuidance(
+                width, height, job.guidance, settings["runtimeDir"], job.depth_interval,
+                adapter_luid=(enhancer.shared_resource_info or {}).get("adapter_luid", ""),
+                shared_resources=bool(settings["sharedResources"]),
+            ) as guidance:
+                shared_enabled = enhancer.shared_submit_ready and guidance.shared_abi_ready
+                if enhancer.shared_interop_ready and not shared_enabled:
+                    raise RuntimeError(
+                        "D3D12 shared resources were enabled, but the native NVOF/DLSSNR "
+                        "shared ABI is incomplete; rebuild both native DLLs or unset "
+                        "TE_DLSS5_SHARED_RESOURCES"
+                    )
+                if shared_enabled:
+                    if sr is not None:
+                        LOGGER.info("[TE DLSS5] native DLSS SR precedes shared NR: SR output readback -> CPU RGBA (not GPU-only chaining)")
+                    slot_count = enhancer.shared_resource_info["slot_count"]
+                    for slot_index in range(slot_count):
+                        handles = enhancer.export_shared_slot(slot_index)
+                        try:
+                            guidance.attach_shared_slot(
+                                slot_index, handles, enhancer.shared_resource_info,
+                            )
+                        finally:
+                            enhancer.close_shared_slot_handles(handles)
+                    LOGGER.info(
+                        "[TE DLSS5] CUDA-D3D12 interop active: slots=%d, "
+                        "NVOF writes actual DLSSNR color/motion textures",
+                        slot_count,
+                    )
+                    if ab_enabled:
+                        LOGGER.info("[TE DLSS5] A/B diagnostic disabled for shared-texture mode")
+                        ab_enabled = False
                 if ab_enabled:
                     # The second instance receives the exact same source
                     # frames but no motion/depth. It is diagnostic only and
@@ -414,23 +489,49 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                         LOGGER.warning("[TE DLSS5] A/B diagnostic unavailable; continuing guided run: %s", exc)
                         ab_enhancer = None
                         ab_enabled = False
-                async_enabled = (
-                    not ab_enabled and
+                async_enabled = shared_enabled or (
+                    not ab_enabled and enhancer.async_ready and
                     os.environ.get("TE_DLSS5_ASYNC_NATIVE", "1").strip().lower()
                     in {"1", "true", "yes", "on"}
                 )
                 if async_enabled:
-                    # The DLL remains single-threaded, but a one-worker queue
-                    # lets guidance for frame N+1 overlap the native GPU work
-                    # for frame N. Ordering is preserved by the executor.
-                    async_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="te-dlss5-native")
-                    LOGGER.info("[TE DLSS5] native submit queue enabled: depth=2")
-                LOGGER.info("[TE DLSS5] native DLSSNR backend ready; frame pipeline=RGBA -> guidance -> DLSSNR Feature 18 -> H.264")
+                    # The native DLL owns three command allocators, resource
+                    # sets and fence values. Python only keeps ordered opaque
+                    # tokens, allowing guidance for the next frame to run
+                    # while the GPU processes up to two earlier frames.
+                    LOGGER.info("[TE DLSS5] native submit queue enabled: depth=3")
+                elif not ab_enabled and os.environ.get("TE_DLSS5_ASYNC_NATIVE", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                    LOGGER.info("[TE DLSS5] native async ABI unavailable; using synchronous processing")
+                if shared_enabled:
+                    if sr is not None:
+                        LOGGER.info(
+                            "[TE DLSS5] frame pipeline=CPU RGBA -> native DLSS SR -> "
+                            "CPU RGBA -> CUDA NVOF -> shared D3D12 color/motion -> "
+                            "DLSSNR Feature 18 -> readback -> H.264"
+                        )
+                    else:
+                        LOGGER.info(
+                            "[TE DLSS5] frame pipeline=CPU RGBA -> CUDA NVOF -> shared D3D12 "
+                            "color/motion -> DLSSNR Feature 18 -> readback -> H.264"
+                        )
+                elif sr is not None:
+                    LOGGER.info(
+                        "[TE DLSS5] frame pipeline=CPU RGBA (%sx%s) -> native DLSS SR "
+                        "(%sx%s) -> DLSSNR Feature 18 -> readback -> H.264",
+                        source_width, source_height, width, height,
+                    )
+                else:
+                    LOGGER.info("[TE DLSS5] native DLSSNR backend ready; frame pipeline=RGBA -> guidance -> DLSSNR Feature 18 -> H.264")
+                encoder_args = _encoder_args(ffmpeg)
+                LOGGER.info(
+                    "[TE DLSS5] encoder=%s",
+                    "h264_nvenc" if "h264_nvenc" in encoder_args else "libx264",
+                )
                 encode = subprocess.Popen(
                     [
                         ffmpeg, "-y", "-v", "error", "-f", "rawvideo",
                         "-pix_fmt", "rgba", "-s:v", f"{width}x{height}", "-r", str(fps),
-                        "-i", "-", "-an", *_encoder_args(ffmpeg),
+                        "-i", "-", "-an", *encoder_args,
                         "-pix_fmt", _output_pix_fmt(),
                         *_color_args(info),
                         str(silent_video),
@@ -441,26 +542,97 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                 if encode.stdin is None:
                     raise RuntimeError("Failed to create FFmpeg output pipe")
 
-                def process_frame(frame: bytes):
+                shared_sequence = 0
+
+                def collect_native(token: int) -> bytes:
+                    started = time.perf_counter()
+                    try:
+                        return enhancer.collect(token)
+                    finally:
+                        timing["collect"] += time.perf_counter() - started
+
+                def write_processed(frames: list[bytes]) -> None:
+                    if not frames:
+                        return
+                    started = time.perf_counter()
+                    for processed in frames:
+                        encode.stdin.write(processed)
+                    timing["encode_write"] += time.perf_counter() - started
+
+                def log_timing(count: int) -> None:
+                    if count <= 0:
+                        return
+                    LOGGER.info(
+                        "[TE DLSS5] timing avg/frame: decode=%.2fms sr=%.2fms guidance=%.2fms "
+                        "native_submit=%.2fms native_wait/readback=%.2fms "
+                        "encode_write=%.2fms measured_total=%.2fms",
+                        timing["decode"] * 1000.0 / count,
+                        timing["sr"] * 1000.0 / count,
+                        timing["guidance"] * 1000.0 / count,
+                        timing["submit"] * 1000.0 / count,
+                        timing["collect"] * 1000.0 / count,
+                        timing["encode_write"] * 1000.0 / count,
+                        sum(timing.values()) * 1000.0 / count,
+                    )
+
+                def process_frame(frame: bytes) -> list[bytes]:
+                    nonlocal shared_sequence
                     import numpy as np
 
+                    if sr is not None:
+                        started = time.perf_counter()
+                        frame = sr.process(frame)
+                        timing["sr"] += time.perf_counter() - started
                     rgba = np.frombuffer(frame, dtype=np.uint8).reshape((height, width, 4))
-                    motion, depth = guidance.next(rgba)
+                    guidance_started = time.perf_counter()
+                    if shared_enabled:
+                        slot_index = shared_sequence % slot_count
+                        producer_value = shared_sequence + 1
+                        motion, depth = guidance.next(
+                            rgba, shared_slot=slot_index,
+                            producer_fence_value=producer_value,
+                        )
+                    else:
+                        slot_index = -1
+                        producer_value = 0
+                        motion, depth = guidance.next(rgba)
+                    timing["guidance"] += time.perf_counter() - guidance_started
                     reset = guidance.consume_reset()
+                    outputs = []
                     if reset:
-                        if async_executor is not None:
-                            async_executor.submit(enhancer.reset)
-                        else:
-                            enhancer.reset()
+                        # A reset is a temporal boundary. Preserve already
+                        # submitted output order before resetting Feature 18.
+                        while pending_native:
+                            outputs.append(collect_native(pending_native.popleft()))
+                        enhancer.reset()
                         if ab_enhancer is not None:
                             ab_enhancer.reset()
-                    if async_executor is not None:
-                        pending_native.append(async_executor.submit(
-                            enhancer.process, frame, motion, depth))
-                        if len(pending_native) <= 1:
-                            return None
-                        return pending_native.popleft().result()
-                    guided = enhancer.process(frame, motion, depth)
+                    if shared_enabled:
+                        submit_started = time.perf_counter()
+                        try:
+                            pending_native.append(
+                                enhancer.submit_shared(slot_index, producer_value, depth)
+                            )
+                        finally:
+                            timing["submit"] += time.perf_counter() - submit_started
+                        shared_sequence += 1
+                        if len(pending_native) > 2:
+                            outputs.append(collect_native(pending_native.popleft()))
+                        return outputs
+                    if async_enabled:
+                        submit_started = time.perf_counter()
+                        try:
+                            pending_native.append(enhancer.submit(frame, motion, depth))
+                        finally:
+                            timing["submit"] += time.perf_counter() - submit_started
+                        if len(pending_native) > 2:
+                            outputs.append(collect_native(pending_native.popleft()))
+                        return outputs
+                    submit_started = time.perf_counter()
+                    try:
+                        guided = enhancer.process(frame, motion, depth)
+                    finally:
+                        timing["submit"] += time.perf_counter() - submit_started
                     if ab_enhancer is not None:
                         baseline = ab_enhancer.process(frame)
                         a = np.frombuffer(guided, dtype=np.uint8).astype(np.float32)
@@ -477,46 +649,59 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
                                 "[TE DLSS5] A/B frame=%d guided-vs-zero MAE=%.3f PSNR=%.2f dB",
                                 index, mae, psnr,
                             )
-                    return guided
+                    outputs.append(guided)
+                    return outputs
 
                 if images is None:
+                    decode_args = [ffmpeg, "-v", "error", "-i", str(job.source), "-map", "0:v:0",
+                                   "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
                     decode = subprocess.Popen(
-                        [ffmpeg, "-v", "error", "-i", str(job.source), "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        decode_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
                     if decode.stdout is None:
                         raise RuntimeError("Failed to create FFmpeg input pipe")
                     while True:
-                        frame = _read_exact(decode.stdout, frame_size)
+                        decode_started = time.perf_counter()
+                        source_frame_size = source_width * source_height * 4
+                        frame = _read_exact(decode.stdout, source_frame_size)
+                        timing["decode"] += time.perf_counter() - decode_started
                         if not frame:
                             break
-                        if len(frame) != frame_size:
+                        if len(frame) != source_frame_size:
                             raise RuntimeError("FFmpeg ended with a partial RGBA frame")
-                        processed = process_frame(frame)
-                        if processed is not None:
-                            encode.stdin.write(processed)
+                        write_processed(process_frame(frame))
                         frame_count += 1
                         if frame_count == 1 or frame_count % 30 == 0:
                             LOGGER.info("[TE DLSS5] processed frame=%d", frame_count)
+                            log_timing(frame_count)
                 else:
                     import numpy as np
 
                     for frame_tensor in images:
-                        frame = frame_tensor.detach().float().clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
+                        source_frame = frame_tensor.detach().float().clamp(0.0, 1.0)
+                        if source_frame.ndim != 3 or int(source_frame.shape[-1]) not in (3, 4):
+                            channels = int(source_frame.shape[-1]) if source_frame.ndim >= 1 else 0
+                            raise RuntimeError(
+                                f"IMAGE frames must have 3 or 4 channels, got {channels}"
+                            )
+                        frame = source_frame.mul(255.0).byte().cpu().numpy()
                         if frame.shape[-1] == 3:
                             alpha = np.full((*frame.shape[:2], 1), 255, dtype=np.uint8)
                             frame = np.concatenate((frame, alpha), axis=-1)
-                        if frame.shape != (height, width, 4):
-                            raise RuntimeError("IMAGE frames must have 3 or 4 channels")
-                        processed = process_frame(frame.tobytes())
-                        if processed is not None:
-                            encode.stdin.write(processed)
+                        if frame.shape != (source_height, source_width, 4):
+                            raise RuntimeError(
+                                f"IMAGE source frame shape mismatch: {frame.shape}, "
+                                f"expected {(source_height, source_width, 4)}"
+                            )
+                        frame = np.ascontiguousarray(frame, dtype=np.uint8)
+                        write_processed(process_frame(frame.tobytes()))
                         frame_count += 1
                         if frame_count == 1 or frame_count % 30 == 0:
                             LOGGER.info("[TE DLSS5] processed frame=%d", frame_count)
+                            log_timing(frame_count)
                 while pending_native:
-                    encode.stdin.write(pending_native.popleft().result())
+                    write_processed([collect_native(pending_native.popleft())])
+                log_timing(frame_count)
                 encode.stdin.close()
                 decode_ok = images is not None or decode.wait() == 0
                 encode_code = encode.wait()
@@ -533,8 +718,6 @@ def run_video_job(job: VideoJob, *, images=None, frame_count: int = 0, audio=Non
         finally:
             _stop_process(decode)
             _stop_process(encode)
-            if async_executor is not None:
-                async_executor.shutdown(wait=True, cancel_futures=True)
             if ab_enhancer is not None:
                 ab_enhancer.close()
 
