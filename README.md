@@ -1,3 +1,8 @@
+注意:因模型文件较大,此github链接内文件还缺少模型文件夹请去网盘下载:
+https://pan.quark.cn/s/2d4816b6cd1f
+下载压缩包里的runtime文件移动至custom_nodes\TE-ComfyUI-DLSS5\runtime.或者直接用网盘里的即可.
+
+
 # TE-ComfyUI-DLSS5
 
 ## 版本
