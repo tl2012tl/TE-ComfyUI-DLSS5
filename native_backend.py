@@ -4,6 +4,7 @@ import ctypes
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -410,6 +411,61 @@ class NativeEnhancer:
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
+
+# Creating the bridge is expensive: it opens a D3D12 device, initialises the NGX
+# runtime and creates DLSSNR Feature 18. Measured on an RTX 5070 Ti Laptop this
+# costs 2.2-2.6 s per call, which dominates every still-image prompt. Resetting
+# is cheap and `te_nr_reset` restores exactly the state a freshly created
+# instance starts in (verified byte-identical output across a new instance, a
+# reset instance, and an instance that had already processed a different frame
+# before being reset), so instances are kept alive and reused.
+_ENHANCER_SLOTS = 4
+_ENHANCER_CACHE: dict[tuple, NativeEnhancer] = {}
+_ENHANCER_ORDER: list[tuple] = []
+_ENHANCER_LOCK = threading.Lock()
+
+
+def acquire_enhancer(dll_path: str, width: int, height: int, settings: dict,
+                     slots: int = _ENHANCER_SLOTS) -> NativeEnhancer:
+    """Return a reusable bridge instance for this configuration.
+
+    The returned instance is owned by the cache and must NOT be closed by the
+    caller. Callers are responsible for calling ``reset()`` before use, because
+    a cached instance still carries the temporal history of whatever ran before
+    it.
+    """
+    key = (str(Path(dll_path).expanduser()), int(width), int(height),
+           json.dumps(settings, sort_keys=True))
+    with _ENHANCER_LOCK:
+        cached = _ENHANCER_CACHE.get(key)
+        if cached is not None and getattr(cached, "_handle", None):
+            _ENHANCER_ORDER.remove(key)
+            _ENHANCER_ORDER.append(key)
+            LOGGER.info("[TE DLSS5] reusing cached DLSSNR bridge for %sx%s", width, height)
+            return cached
+        # A cached entry without a handle was closed underneath us; rebuild it.
+        _ENHANCER_CACHE.pop(key, None)
+        if key in _ENHANCER_ORDER:
+            _ENHANCER_ORDER.remove(key)
+        while len(_ENHANCER_ORDER) >= max(1, int(slots)):
+            evicted = _ENHANCER_ORDER.pop(0)
+            victim = _ENHANCER_CACHE.pop(evicted, None)
+            if victim is not None:
+                victim.close()
+        enhancer = NativeEnhancer(dll_path, width, height, settings)
+        _ENHANCER_CACHE[key] = enhancer
+        _ENHANCER_ORDER.append(key)
+        return enhancer
+
+
+def release_all() -> None:
+    """Close every cached bridge and drop it. Safe to call at any time."""
+    with _ENHANCER_LOCK:
+        for enhancer in _ENHANCER_CACHE.values():
+            enhancer.close()
+        _ENHANCER_CACHE.clear()
+        _ENHANCER_ORDER.clear()
 
 
 def resolve_backend(explicit: str = "") -> Optional[str]:

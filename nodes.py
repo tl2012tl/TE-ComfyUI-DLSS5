@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from .native_backend import NativeBackendError, NativeEnhancer, resolve_backend, resolve_runtime_dir
+from .native_backend import (
+    NativeBackendError,
+    acquire_enhancer,
+    resolve_backend,
+    resolve_runtime_dir,
+)
 from .frame_guidance import FrameGuidance
 from .video_pipeline import VideoJob, run_video_job
 from .frame_generation_pipeline import FrameGenerationJob, run_frame_generation_job
@@ -205,22 +210,23 @@ class TE_DLSS5_PictureEnhancer:
                 "sharedResources": False,
             }
             frame_bytes = frame.tobytes(order="C")
-            with NativeEnhancer(backend, width, height, settings) as enhancer:
-                if guidance == "zero":
-                    result = enhancer.process(frame_bytes)
-                else:
-                    # A still image has no temporal pair. NVOF therefore
-                    # returns a zero bootstrap vector; depth mode avoids
-                    # starting an optical-flow session when only depth is
-                    # needed. Both paths use the same guided native call as
-                    # the first frame of the video node.
-                    with FrameGuidance(
-                        width, height, str(guidance), settings["runtimeDir"], depth_interval=1
-                    ) as guide:
-                        motion, depth = guide.next(frame)
-                        if guide.consume_reset():
-                            enhancer.reset()
-                        result = enhancer.process(frame_bytes, motion, depth)
+            # The bridge is cached across prompts. reset() gives it the same
+            # empty temporal history a freshly created instance starts with.
+            enhancer = acquire_enhancer(backend, width, height, settings)
+            enhancer.reset()
+            if guidance == "zero":
+                result = enhancer.process(frame_bytes)
+            else:
+                # A still image has no temporal pair. NVOF therefore
+                # returns a zero bootstrap vector; depth mode avoids
+                # starting an optical-flow session when only depth is
+                # needed. Both paths use the same guided native call as
+                # the first frame of the video node.
+                with FrameGuidance(
+                    width, height, str(guidance), settings["runtimeDir"], depth_interval=1
+                ) as guide:
+                    motion, depth = guide.next(frame)
+                    result = enhancer.process(frame_bytes, motion, depth)
             output = np.frombuffer(result, dtype=np.uint8).reshape((height, width, 4)).copy()
             if channels == 3:
                 output = output[..., :3]
