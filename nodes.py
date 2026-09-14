@@ -6,7 +6,6 @@ from .native_backend import (
     resolve_backend,
     resolve_runtime_dir,
 )
-from .frame_guidance import FrameGuidance
 from .video_pipeline import VideoJob, run_video_job
 from .frame_generation_pipeline import FrameGenerationJob, run_frame_generation_job
 
@@ -202,7 +201,11 @@ class TE_DLSS5_PictureEnhancer:
                 "skinStructureStrength": max(-1.0, min(2.0, float(skin_structure_strength))),
                 "automaticMask": bool(automatic_mask),
                 "uiCorrection": bool(ui_correction),
-                "guidance": str(guidance),
+                # `guidance` is deliberately not forwarded: it is a temporal
+                # setting, and on this bridge its value does not change the
+                # result either - absent, any valid value, and an unknown value
+                # all produce identical output. Leaving it out keeps the bridge
+                # reusable across all three dropdown choices.
                 "runtimeDir": str(resolve_runtime_dir()),
                 # The still-image path deliberately keeps the established
                 # synchronous staging ABI. Shared slots are a temporal NVOF
@@ -214,30 +217,29 @@ class TE_DLSS5_PictureEnhancer:
             # empty temporal history a freshly created instance starts with.
             enhancer = acquire_enhancer(backend, width, height, settings)
             enhancer.reset()
-            if guidance == "zero":
-                result = enhancer.process(frame_bytes)
-            else:
-                # A still image has no temporal pair. NVOF therefore
-                # returns a zero bootstrap vector; depth mode avoids
-                # starting an optical-flow session when only depth is
-                # needed. Both paths use the same guided native call as
-                # the first frame of the video node.
-                with FrameGuidance(
-                    width, height, str(guidance), settings["runtimeDir"], depth_interval=1
-                ) as guide:
-                    motion, depth = guide.next(frame)
-                    result = enhancer.process(frame_bytes, motion, depth)
+            # A still image is a single frame evaluated with no temporal
+            # history, and in that state DLSSNR's motion and depth guides do
+            # not affect the result at all: with a freshly reset bridge,
+            # motion and depth held at zero, at one, at random values, or with
+            # the depth plane omitted entirely, all produce byte-identical
+            # output. The guides only begin to influence the picture from the
+            # second frame onwards, which is why the video path still builds
+            # them. Building them here would add a CUDA optical-flow session
+            # plus a Depth Anything V2 inference per image for no change to
+            # the picture.
+            result = enhancer.process(frame_bytes)
             output = np.frombuffer(result, dtype=np.uint8).reshape((height, width, 4)).copy()
             if channels == 3:
                 output = output[..., :3]
             output = torch.from_numpy(output).float().div(255.0).unsqueeze(0)
             return (
                 output,
-                f"TE DLSS5 NR picture complete: {width}x{height} | guidance={guidance} | style={style} | "
+                f"TE DLSS5 NR picture complete: {width}x{height} | style={style} | "
                 f"intensity={settings['intensity']:.2f} | local_tone={settings['localToneStrength']:.2f} | "
                 f"local_structure={settings['localStructureStrength']:.2f} | nr_preset={settings['nrPreset']} | "
                 f"skin_structure={settings['skinStructureStrength']:.2f} | auto_mask={int(settings['automaticMask'])} | "
-                f"ui_correction={int(settings['uiCorrection'])}",
+                f"ui_correction={int(settings['uiCorrection'])} | motion/depth guides not applied "
+                f"(guidance={guidance} has no effect on a single frame)",
             )
         except Exception as exc:
             raise RuntimeError(f"TE DLSS5 picture processing failed: {_bounded_error(exc)}") from None
